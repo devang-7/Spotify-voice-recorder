@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { Mic, Square, Play, Pause, Trash2, Heart, SkipBack, SkipForward, Volume2, Upload, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { supabase } from './Supabase.js';
 
 export default function SpotifyVoiceRecorder() {
   const [recordings, setRecordings] = useState([]);
@@ -100,55 +101,83 @@ export default function SpotifyVoiceRecorder() {
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
+ const stopRecording = () => {
+  if (mediaRecorderRef.current && isRecording) {
+    mediaRecorderRef.current.stop();
+    setIsRecording(false);
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
     }
-  };
 
-  const togglePlayback = async (id, url) => {
-    const audio = audioRefs.current[id];
-    
-    if (playingId === id && audio && !audio.paused) {
-      audio.pause();
-      setPlayingId(null);
-    } else {
-      Object.values(audioRefs.current).forEach(a => {
-        if (a) a.pause();
-      });
+    // Update the onstop handler to save to Supabase
+    mediaRecorderRef.current.onstop = async () => {
+      const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
       
-      if (!audio) {
-        const newAudio = new Audio(url);
-        audioRefs.current[id] = newAudio;
-        newAudio.onended = () => {
-          setPlayingId(null);
-          setCurrentTime(0);
+      // Convert blob to base64 for storage
+      const reader = new FileReader();
+      reader.readAsDataURL(audioBlob);
+      reader.onloadend = async () => {
+        const base64Audio = reader.result;
+        
+        const newRecording = {
+          id: Date.now(),
+          url: base64Audio,
+          blob: audioBlob,
+          label: currentLabel || 'Untitled Recording',
+          timestamp: new Date().toLocaleString(),
+          duration: recordingTime,
+          albumArt: albumArt
         };
-        newAudio.onerror = (e) => {
-          console.error('Audio playback error:', e);
-          setPlayingId(null);
-        };
+
         try {
-          await newAudio.play();
-          setPlayingId(id);
+          // Save to Supabase database
+          const { data, error } = await supabase
+            .from('recordings')
+            .insert([
+              {
+                label: newRecording.label,
+                audio_url: newRecording.url,
+                album_art: newRecording.albumArt,
+                duration: newRecording.duration,
+                timestamp: new Date().toISOString()
+              }
+            ])
+            .select();
+
+          if (error) {
+            console.error('Error saving recording:', error);
+            // Fallback: still add to local state even if DB fails
+            setRecordings(prev => [newRecording, ...prev]);
+          } else {
+            console.log('Recording saved to database:', data);
+            // Use the ID from database for consistency
+            const dbRecording = {
+              ...newRecording,
+              id: data[0].id
+            };
+            setRecordings(prev => [dbRecording, ...prev]);
+          }
         } catch (err) {
-          console.error('Play error:', err);
+          console.error('Failed to save recording:', err);
+          // Fallback to local storage
+          setRecordings(prev => [newRecording, ...prev]);
         }
-      } else {
-        try {
-          await audio.play();
-          setPlayingId(id);
-        } catch (err) {
-          console.error('Play error:', err);
+
+        // Reset states
+        setCurrentLabel('');
+        setRecordingTime(0);
+        setAlbumArt(null);
+        setShowRecordModal(false);
+        
+        // Clean up media stream
+        if (mediaRecorderRef.current?.stream) {
+          mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
         }
-      }
-    }
-  };
+      };
+    };
+  }
+};
 
   const skipToNext = () => {
     const currentIndex = recordings.findIndex(r => r.id === playingId);
@@ -172,6 +201,83 @@ export default function SpotifyVoiceRecorder() {
       setCurrentTime(seekTime);
     }
   };
+
+ const togglePlayback = async (id, url) => {
+  const audio = audioRefs.current[id];
+  
+  if (playingId === id && audio && !audio.paused) {
+    audio.pause();
+    setPlayingId(null);
+  } else {
+    Object.values(audioRefs.current).forEach(a => {
+      if (a) a.pause();
+    });
+    
+    if (!audio) {
+      // Handle both blob URLs and base64 data URLs
+      const audioUrl = url.startsWith('data:audio') ? url : url;
+      const newAudio = new Audio(audioUrl);
+      audioRefs.current[id] = newAudio;
+      
+      newAudio.onended = () => {
+        setPlayingId(null);
+        setCurrentTime(0);
+      };
+      newAudio.onerror = (e) => {
+        console.error('Audio playback error:', e);
+        setPlayingId(null);
+      };
+      try {
+        await newAudio.play();
+        setPlayingId(id);
+      } catch (err) {
+        console.error('Play error:', err);
+      }
+    } else {
+      try {
+        await audio.play();
+        setPlayingId(id);
+      } catch (err) {
+        console.error('Play error:', err);
+      }
+    }
+  }
+};
+
+// Add this function to load recordings on app start
+const loadRecordingsFromDB = async () => {
+  try {
+    const { data, error } = await supabase
+      .from('recordings')
+      .select('*')
+      .order('timestamp', { ascending: false });
+
+    if (error) {
+      console.error('Error loading recordings:', error);
+      return;
+    }
+
+    if (data) {
+      const formattedRecordings = data.map(rec => ({
+        id: rec.id,
+        url: rec.audio_url,
+        label: rec.label,
+        albumArt: rec.album_art,
+        duration: rec.duration,
+        timestamp: new Date(rec.timestamp).toLocaleString(),
+        blob: null // We can't store Blob in DB, so we'll handle playback differently
+      }));
+      setRecordings(formattedRecordings);
+    }
+  } catch (err) {
+    console.error('Failed to load recordings:', err);
+  }
+};
+
+// Call this in useEffect on component mount
+useEffect(() => {
+  loadRecordingsFromDB();
+}, []);
 
   const deleteRecording = (id) => {
     const audio = audioRefs.current[id];
