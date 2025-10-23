@@ -279,16 +279,40 @@ useEffect(() => {
   loadRecordingsFromDB();
 }, []);
 
-  const deleteRecording = (id) => {
-    const audio = audioRefs.current[id];
-    if (audio) {
-      audio.pause();
-      delete audioRefs.current[id];
-    }
-    setRecordings(prev => prev.filter(r => r.id !== id));
-    if (playingId === id) {
-      setPlayingId(null);
-      setCurrentTime(0);
+const deleteRecording = async (id) => {
+    try {
+      // Delete from Supabase database
+      const { error } = await supabase
+        .from('recordings')
+        .delete()
+        .eq('id', id);
+
+      if (error) {
+        console.error('Error deleting recording from database:', error);
+        alert('Failed to delete recording from database');
+        return;
+      }
+
+      // Clean up audio reference
+      const audio = audioRefs.current[id];
+      if (audio) {
+        audio.pause();
+        delete audioRefs.current[id];
+      }
+
+      // Remove from local state
+      setRecordings(prev => prev.filter(r => r.id !== id));
+      
+      // Reset player if this recording was playing
+      if (playingId === id) {
+        setPlayingId(null);
+        setCurrentTime(0);
+      }
+
+      console.log('Recording deleted successfully');
+    } catch (err) {
+      console.error('Failed to delete recording:', err);
+      alert('Failed to delete recording');
     }
   };
 
